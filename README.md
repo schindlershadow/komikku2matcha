@@ -1,7 +1,7 @@
 # komikku2matcha
 
 Turns chapter CBZs downloaded by Komikku (or Mihon/Tachiyomi) into [Matcha Reader](https://github.com/eszter007/matcha-reader)
-manga books for the Xteink X4 / X4 Pro, using Matcha's own converter (`tools/manga_convert/convert_manga.py`).
+manga books for the Xteink X4 / X4 Pro and X3 (`--device x3`, or Settings → Conversion in the app), using Matcha's own converter (`tools/manga_convert/convert_manga.py`).
 
 There is also an **Android app** that drives all of this from your phone: it scans Komikku's download folder, uploads new
 chapters to the server for conversion, and manages the converted books and the X4. It works **standalone** too: with no server
