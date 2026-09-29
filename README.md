@@ -182,8 +182,12 @@ and ComicInfo.xml weren't the problem, since both tools accept WebP.
 
 <p>
   <img src="docs/library.png" width="260" alt="Library tab listing series found in Komikku's download folder">
+  <img src="docs/books.png" width="260" alt="Books tab listing converted books">
   <img src="docs/settings.png" width="260" alt="Settings tab: server URL, token and X4 options">
 </p>
+
+Built for the [Matcha Reader firmware](https://github.com/eszter007/matcha-reader) on the Xteink X4 / X4 Pro; the screenshots below use
+sample series generated for this README.
 
 `k2m_server.py` wraps this tool in a small token-protected HTTP API. `android/` is an app that drives it from your phone:
 
