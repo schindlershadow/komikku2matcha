@@ -1,0 +1,3 @@
+<resources>
+    <style name="Theme.K2M" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>

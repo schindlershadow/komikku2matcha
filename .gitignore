@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.apk
+*.apk.json
+*.jks
+android/build/
+android/app/build/
+android/.gradle/
+android/local.properties
+*.bak-*

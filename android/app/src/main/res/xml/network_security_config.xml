@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The server on the home LAN and the X4's WebDAV server only speak plain HTTP, and both are
+     addressed by IP, which domain-config can't match. Remote access goes over HTTPS. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>
