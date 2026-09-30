@@ -15,6 +15,7 @@ conversion runs komikku2matcha.py with the configured venv, one job at a time.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import hmac
 import ipaddress
 import json
@@ -164,6 +165,41 @@ def save_ignored(d: dict):
 
 def covers_dir(cfg) -> Path:
     return Path(cfg["output"]) / ".covers"
+
+
+def sleep_dir(cfg) -> Path:
+    return Path(cfg["output"]) / ".sleep"
+
+
+def sleep_size(device: str | None) -> tuple[int, int]:
+    return k2m.DEVICE_TARGETS.get(device or "x4", k2m.DEVICE_TARGETS["x4"])
+
+
+def sleep_items(cfg) -> list[dict]:
+    """The sleep screens on the server: one per series folder, with where each came from."""
+    sdir = sleep_dir(cfg)
+    if not sdir.is_dir():
+        return []
+    series = {t["folder"]: t["series"] for t in library(cfg)["titles"]}
+    out = []
+    for img in sorted(sdir.glob("*.bmp"), key=lambda p: k2m.natural_key(p.name)):
+        st = img.stat()
+        out.append({"name": img.stem, "series": series.get(img.stem, img.stem), "bytes": st.st_size,
+                    "mtime": st.st_mtime, "custom": covers.sleep_files(sdir, img.stem)[2].is_file()})
+    return out
+
+
+def generate_sleep(cfg, folders: list[str], device: str | None, force: bool = False) -> dict[str, str]:
+    """Draw sleep screens from series art (fetching it if needed). folder → result (see covers.make_sleep)."""
+    titles = {t["folder"]: t["series"] for t in library(cfg)["titles"]}
+    out = {}
+    for folder in folders:
+        art = covers.cover_art(covers_dir(cfg), folder, titles.get(folder, folder), fetch=cfg.get("fetch_covers", True))
+        try:
+            out[folder] = covers.make_sleep(sleep_dir(cfg), folder, art, sleep_size(device), force=force)
+        except Exception as e:  # a corrupt art file must not stop the others
+            out[folder] = f"failed: {e}"
+    return out
 
 
 def cover_candidates(cfg, folder: str) -> list[dict]:
@@ -596,6 +632,18 @@ class Jobs:
             if proc.returncode != 0 and not job["outcomes"] and not job.get("cancel"):
                 job["status"] = "failed"
                 job["error"] = job.get("error") or f"converter exited {proc.returncode}"
+            converted = sorted({o["label"].split("/")[0] for o in job["outcomes"] if o["status"] == "converted" and "/" in o["label"]})
+        if p.get("sleep") and converted and not job.get("cancel"):
+            # A failure here (no art, no network) is a note on the job, never a failed conversion.
+            try:
+                res = generate_sleep(self.cfg, converted, p.get("device"))
+                made = sum(v in ("created", "updated") for v in res.values())
+                if made:
+                    with self.lock:
+                        job["note"] = f"{made} sleep screen(s) made"
+            except Exception as e:
+                with self.lock:
+                    job["note"] = f"sleep screens failed: {e}"
 
     def _delete(self, job):
         """Delete converted books from the server; with "ignore", also their uploaded CBZs, and remember them so
@@ -683,6 +731,12 @@ class Jobs:
             with self.lock:
                 job["outcomes"].append({"label": rel, "status": status, "detail": detail})
                 job["done"] += 1
+            if p.get("sleep") and entry is not None and status != "failed":
+                try:
+                    pusher.push_sleep(sleep_dir(self.cfg), rel.split("/")[1])
+                except Exception as e:
+                    with self.lock:
+                        job["note"] = f"sleep screen not sent: {e}"
 
 
 # ── Device (X4 File Transfer mode) ──────────────────────────────
@@ -852,6 +906,26 @@ class DevicePusher:
         return "pushed", f"updated {len(need)} of {len(files)} files ({size / 1e6:.1f} MB)" + \
             (f", removed {len(stray)}" if stray else "")
 
+    def push_sleep(self, sdir: Path, folder: str) -> bool:
+        """Copy a series' sleep screen to /sleep/<folder>.bmp (Matcha's Custom sleep screen picks from there).
+        Skipped if the X4 has it with the same size and it's what this server last sent (every BMP for a screen
+        is the same size, so size alone can't tell a redrawn one). Returns whether it sent one."""
+        img = covers.sleep_files(sdir, folder)[0]
+        if not img.is_file():
+            return False
+        data = img.read_bytes()
+        sha = hashlib.sha1(data).hexdigest()
+        have = self.sizes("/sleep")
+        if have is None:
+            self.mkdirs("/sleep")
+            have = {}
+        known = pushed_record("/sleep")
+        if have.get(img.name) == len(data) and known.get(img.name) == sha:
+            return False
+        self.put("/sleep", img.name, data)
+        remember_pushed("/sleep", {**known, img.name: sha})
+        return True
+
     def put(self, dest: str, name: str, data: bytes):
         status, body = self._req("PUT", f"{dest}/{name}", data=data,
                                  headers={"Content-Type": "application/octet-stream"}, timeout=120)
@@ -955,6 +1029,23 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/covers/candidate":
                 cand = candidate_path(self.cfg, q.get("title", ""), q.get("id", "")) if safe_name(q.get("title", "")) else None
                 return self._image(cand, int(q.get("w") or 0)) if cand else self._err(404, "no such candidate")
+            if path == "/api/sleep":
+                return self._json({"items": sleep_items(self.cfg)})
+            if path == "/api/sleep/file":  # the BMP itself, for sending to the X4 from the phone
+                name = q.get("name", "")
+                f = covers.sleep_files(sleep_dir(self.cfg), name)[0] if safe_name(name) else None
+                if not f or not f.is_file():
+                    return self._err(404, "no such sleep screen")
+                data = f.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "image/bmp")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                return self.wfile.write(data)
+            if path == "/api/sleep/image":  # a JPEG preview
+                name = q.get("name", "")
+                f = covers.sleep_files(sleep_dir(self.cfg), name)[0] if safe_name(name) else None
+                return self._image(f, int(q.get("w") or 400)) if f and f.is_file() else self._err(404, "no such sleep screen")
             if path == "/api/books/manifest":
                 book = resolve_book(self.cfg, q.get("path", ""))
                 if not book:
@@ -1068,6 +1159,16 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._err(400, f"not an image ({e})")
             return self._json({"ok": True})
+        if path == "/api/sleep":  # the user's own image (any format Pillow reads) becomes the series' sleep screen
+            name = q.get("name", "")
+            n = int(self.headers.get("Content-Length") or -1)
+            if not safe_name(name) or not 0 < n <= 20_000_000:
+                return self._err(400, "name: a title folder name; body: an image up to 20 MB")
+            try:
+                covers.set_custom_sleep(sleep_dir(self.cfg), name, self.rfile.read(n), sleep_size(q.get("device")))
+            except Exception as e:
+                return self._err(400, f"not an image ({e})")
+            return self._json({"ok": True})
         if path != "/api/upload":
             return self._err(404, "not found")
         title, name = q.get("title", ""), q.get("file", "")
@@ -1113,6 +1214,7 @@ class Handler(BaseHTTPRequestHandler):
                 params["device"] = body["device"]
             if isinstance(body.get("cover_page"), bool):
                 params["cover_page"] = body["cover_page"]
+            params["sleep"] = bool(body.get("sleep"))
             return self._json(self.jobs.submit("convert", params), 201)
         if path == "/api/device/push":
             device, paths = body.get("device", ""), body.get("books") or []
@@ -1128,7 +1230,8 @@ class Handler(BaseHTTPRequestHandler):
                     for k, v in dests.items()):
                 return self._err(400, "dests: {book path: '/<folder on the X4>'}")
             return self._json(self.jobs.submit("push", {"device": device, "books": paths, "dests": dests,
-                                                        "replace": bool(body.get("replace"))}), 201)
+                                                        "replace": bool(body.get("replace")),
+                                                        "sleep": bool(body.get("sleep"))}), 201)
         if path == "/api/covers/komikku":
             # {"covers": {"<title folder>": "<Komikku's thumbnail URL>"}} from the app's reading of a Komikku backup.
             wanted = body.get("covers") or {}
@@ -1154,6 +1257,18 @@ class Handler(BaseHTTPRequestHandler):
             if cid != "custom":
                 shutil.copyfile(cand, covers_dir(self.cfg) / f"{folder}.custom.jpg")
             return self._json({"ok": True})
+        if path == "/api/sleep/generate":
+            # {"titles": [folder...] | "all": true, "device": "x4"|"x3", "force": bool}: draw from the series art.
+            titles = {t["folder"] for t in library(self.cfg)["titles"]}
+            folders = sorted(titles) if body.get("all") else body.get("titles") or []
+            if not isinstance(folders, list) or not all(isinstance(f, str) and f in titles for f in folders):
+                return self._err(400, "titles: list of title folder names from the library")
+            return self._json({"results": generate_sleep(self.cfg, folders, body.get("device"), bool(body.get("force")))})
+        if path == "/api/sleep/delete":
+            names = body.get("names") or []
+            if not isinstance(names, list) or not all(isinstance(n, str) and safe_name(n) for n in names):
+                return self._err(400, "names: list of sleep screen names")
+            return self._json({"deleted": [n for n in names if covers.delete_sleep(sleep_dir(self.cfg), n)]})
         if path == "/api/books/delete":
             books_ = body.get("books") or []
             if not books_ or not all(isinstance(b, str) and resolve_book(self.cfg, b) for b in books_):

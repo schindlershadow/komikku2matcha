@@ -91,7 +91,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private val TABS = listOf("Library", "Jobs", "Books", "Settings")
+private val TABS = listOf("Library", "Jobs", "Books", "Settings", "Sleep")
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -124,7 +124,7 @@ fun App(vm: AppViewModel) {
             NavigationBar {
                 TABS.forEachIndexed { i, name ->
                     NavigationBarItem(selected = tab == i, onClick = { tab = i },
-                        icon = { Text(listOf("📚", "⚙", "📖", "🔧")[i]) }, label = { Text(name) })
+                        icon = { Text(listOf("📚", "⚙", "📖", "🔧", "🌙")[i]) }, label = { Text(name) })
                 }
             }
         },
@@ -136,6 +136,7 @@ fun App(vm: AppViewModel) {
                 1 -> JobsScreen(vm)
                 2 -> BooksScreen(vm)
                 3 -> SettingsScreen(vm)
+                4 -> SleepScreen(vm)
             }
         }
     }
@@ -934,6 +935,25 @@ fun SettingsScreen(vm: AppViewModel) {
             Switch(coverPage, { coverPage = it; vm.setCoverPage(it) })
         }
         Text("Changing either converts the chapters again on the next Sync.", style = MaterialTheme.typography.bodySmall)
+
+        Text("Sleep screens", style = MaterialTheme.typography.titleMedium)
+        var sleepGen by remember { mutableStateOf(vm.prefs.sleepGenerate) }
+        var sleepSend by remember { mutableStateOf(vm.prefs.sleepSend) }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("Draw a sleep screen when a series is converted")
+                Text("A full-screen BMP from the series art, kept on the server (see the Sleep tab).", style = MaterialTheme.typography.bodySmall)
+            }
+            Switch(sleepGen, { sleepGen = it; vm.setSleepGenerate(it) })
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("Send the sleep screen with a series' books")
+                Text("Copies it to the X4's /sleep folder when its books are sent. Choose \"Custom\" as the X4's sleep screen.",
+                    style = MaterialTheme.typography.bodySmall)
+            }
+            Switch(sleepSend, { sleepSend = it; vm.setSleepSend(it) })
+        }
 
         Text("Automatic sync", style = MaterialTheme.typography.titleMedium)
         var auto by remember { mutableStateOf(vm.prefs.autoSync) }

@@ -253,3 +253,73 @@ def render_cover(size: tuple[int, int], art: Path | None, series: str, big: str,
     out = io.BytesIO()
     page.save(out, "JPEG", quality=92, optimize=True, progressive=False)
     return out.getvalue()
+
+
+# ── Sleep screens ───────────────────────────────────────────────
+# Matcha shows a random image from /sleep on the card when its "Custom" sleep screen is chosen. One 8-bit
+# grayscale BMP per series, made from the series art, is kept in <output>/.sleep/<folder>.bmp:
+#   <folder>.bmp     the image (screen-sized, so the firmware draws it 1:1)
+#   <folder>.sig     hash of the art it was drawn from, so a new cover redraws it
+#   <folder>.custom  marker: the user's own image; automatic generation leaves it alone
+
+
+def render_sleep(size: tuple[int, int], art: bytes) -> bytes:
+    """A full-screen 8-bit grayscale BMP of [art], cropped to the screen's shape."""
+    from PIL import Image, ImageOps
+    with Image.open(io.BytesIO(art)) as im:
+        im.load()
+        # Transparent art (PNG uploads) goes on white, not black.
+        if im.mode in ("RGBA", "LA", "P"):
+            im = im.convert("RGBA")
+            bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
+            im = Image.alpha_composite(bg, im)
+        gray = ImageOps.autocontrast(ImageOps.fit(im.convert("L"), size, Image.LANCZOS, centering=(0.5, 0.35)), cutoff=1)
+    out = io.BytesIO()
+    gray.save(out, "BMP")
+    return out.getvalue()
+
+
+def sleep_files(sleep_dir: Path, folder: str) -> tuple[Path, Path, Path]:
+    return sleep_dir / f"{folder}.bmp", sleep_dir / f"{folder}.sig", sleep_dir / f"{folder}.custom"
+
+
+def _write_sleep(sleep_dir: Path, folder: str, bmp: bytes, sig: str, custom: bool) -> None:
+    sleep_dir.mkdir(parents=True, exist_ok=True)
+    img, sigf, marker = sleep_files(sleep_dir, folder)
+    tmp = img.with_suffix(".tmp")
+    tmp.write_bytes(bmp)
+    tmp.replace(img)
+    sigf.write_text(sig)
+    if custom:
+        marker.touch()
+    else:
+        marker.unlink(missing_ok=True)
+
+
+def make_sleep(sleep_dir: Path, folder: str, art: Path | None, size: tuple[int, int], force: bool = False) -> str:
+    """Draw a series' sleep screen from its art. Returns "created", "updated", "unchanged", "custom" (a user
+    image is kept) or "no art"."""
+    img, sigf, marker = sleep_files(sleep_dir, folder)
+    if marker.is_file() and not force:
+        return "custom"
+    if art is None or not art.is_file():
+        return "no art"
+    sig = f"{size[0]}x{size[1]}:{art_sig(art)}"
+    if img.is_file() and not marker.is_file() and sigf.is_file() and sigf.read_text() == sig:
+        return "unchanged"
+    existed = img.is_file()
+    _write_sleep(sleep_dir, folder, render_sleep(size, art.read_bytes()), sig, custom=False)
+    return "updated" if existed else "created"
+
+
+def set_custom_sleep(sleep_dir: Path, folder: str, data: bytes, size: tuple[int, int]) -> None:
+    """Use the user's own image as a series' sleep screen (any format Pillow reads)."""
+    _write_sleep(sleep_dir, folder, render_sleep(size, data), "custom", custom=True)
+
+
+def delete_sleep(sleep_dir: Path, folder: str) -> bool:
+    img = sleep_files(sleep_dir, folder)
+    existed = img[0].is_file()
+    for p in img:
+        p.unlink(missing_ok=True)
+    return existed

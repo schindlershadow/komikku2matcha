@@ -338,6 +338,15 @@ Home URL, so away from home a run just records "skipped" and uses no mobile data
 
 The app tries the home URL first and falls back to the remote one. The server only runs the free local OCR.
 
+**Sleep screens** (the **Sleep** tab): Matcha Reader's *Custom* sleep screen shows a random BMP from `/sleep` on the
+X4, so the app keeps one screen-sized (480x800 X4, 528x792 X3), 8-bit grayscale BMP per series, named after its
+folder. The tab lists them with previews and lets you draw one from the series art (custom > Komikku > AniList),
+pick your own image (kept: auto-drawing never overwrites it, only *Redraw* does), send it to the X4, or delete it.
+Two Settings switches automate it: *Draw sleep screens when converting* (made on the server next to the converted
+book) and *Send sleep screens with books* (copied to `/sleep` whenever a book is transferred, and skipped when the
+X4 already has the identical image). On the X4 you still have to choose **Settings > Sleep Screen > Custom**; a
+`/sleep.bmp` in the root overrides everything, and `/.sleep` is read before `/sleep` (WebDAV can't reach dot-folders).
+
 ### Server setup
 
 ```bash

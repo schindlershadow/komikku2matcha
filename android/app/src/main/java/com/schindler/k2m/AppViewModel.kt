@@ -435,27 +435,86 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Re-draw the first page of every converted chapter of [title] with the current art (no re-conversion). */
-    private fun refreshCoverPages(title: TitleRow) {
-        val keys = title.chapters.filter { it.server != null }.map { it.serverKey }
-        if (keys.isNotEmpty() && prefs.coverPage) TaskBus.enqueue(getApplication(), Task.Sync(emptyList(), keys))
-    }
-
     fun changeCover(title: TitleRow, image: android.net.Uri) = launchBusy("Uploading the cover…") {
         val folder = title.folder ?: return@launchBusy
         val bytes = getApplication<Application>().contentResolver.openInputStream(image)!!.use { it.readBytes() }
         api.setCover(folder, bytes)
         loadCover(folder, force = true)
-        refreshCoverPages(title)
-        message = "Cover changed; updating the chapters' cover pages (send them to the X4 afterwards)"
+        message = "Cover changed; Sync updates the chapters' cover pages"
     }
 
     fun resetCover(title: TitleRow, refetch: Boolean) = launchBusy(if (refetch) "Searching AniList…" else "Resetting the cover…") {
         val folder = title.folder ?: return@launchBusy
         val found = api.resetCover(folder, refetch)
         loadCover(folder, force = true)
-        refreshCoverPages(title)
         message = if (found) "Cover updated from AniList" else "AniList has no cover for this title; the chapter's first page is used"
+    }
+
+    // ── Sleep screens ───────────────────────────────────────────
+
+    /** The server's sleep screens (one per series folder). */
+    var sleepItems by mutableStateOf<List<SleepItem>>(emptyList()); private set
+    /** File name → size of what's in /sleep on the X4 or card; null until "Check X4". */
+    var sleepOnX4 by mutableStateOf<Map<String, Long>?>(null); private set
+    var sleepImages by mutableStateOf<Map<String, androidx.compose.ui.graphics.ImageBitmap?>>(emptyMap()); private set
+    private val sleepFolder = java.io.File(app.filesDir, "sleep")
+    private val sleepStore = PushedStore(java.io.File(app.filesDir, "x4-pushed"))
+
+    fun refreshSleep() = launchBusy("Loading sleep screens…") { loadSleep() }
+
+    private suspend fun loadSleep() {
+        sleepItems = api.sleepList()
+        // Previews are keyed by name and time, so a redrawn one is fetched again.
+        val wanted = sleepItems.map { "${it.name}@${it.mtime}" to it.name }.filter { it.first !in sleepImages }
+        for ((key, name) in wanted) {
+            val bytes = runCatching { api.sleepImage(name, 240) }.getOrNull()
+            val bmp = bytes?.let { android.graphics.BitmapFactory.decodeByteArray(it, 0, it.size)?.asImageBitmap() }
+            sleepImages = sleepImages + (key to bmp)
+        }
+    }
+
+    /** Draw sleep screens from the series art for [folders] (null = all series); [force] also replaces the user's own. */
+    fun generateSleep(folders: List<String>?, force: Boolean = false) = launchBusy("Drawing sleep screens…") {
+        val res = api.sleepGenerate(folders, force)
+        loadSleep()
+        val made = res.values.count { it == "created" || it == "updated" }
+        val noArt = res.values.count { it == "no art" }
+        val kept = res.values.count { it == "custom" }
+        message = "$made sleep screen(s) drawn" + (if (kept > 0) ", $kept of your own kept" else "") +
+            (if (noArt > 0) ", $noArt series have no cover art yet" else "")
+    }
+
+    fun setSleepImage(folder: String, image: Uri) = launchBusy("Uploading the image…") {
+        val bytes = getApplication<Application>().contentResolver.openInputStream(image)!!.use { it.readBytes() }
+        api.setSleep(folder, bytes)
+        loadSleep()
+        message = "Sleep screen set; send it to the X4 to use it"
+    }
+
+    /** Copy the sleep screens of [folders] to the X4 or card; unchanged ones are skipped. */
+    fun sendSleep(folders: List<String>) = launchBusy("Sending sleep screens…") {
+        val ops = target()
+        val sent = SleepSync.send(ops, api, sleepFolder, sleepStore, folders)
+        sleepOnX4 = listSleepOnX4(ops)
+        message = if (sent > 0) "$sent sleep screen(s) sent to $where" else "$where already has them"
+    }
+
+    fun checkSleepX4() = launchBusy("Looking at $where…") { sleepOnX4 = listSleepOnX4(target()) }
+
+    private suspend fun listSleepOnX4(ops: BookOps): Map<String, Long> =
+        ops.storage.list(SleepSync.DIR).orEmpty().filter { !it.dir && it.name.endsWith(".bmp", true) }.associate { it.name to it.size }
+
+    /** Delete sleep screens from the server, the X4/card, or both ([names] are series folders on the server, file names sans .bmp). */
+    fun deleteSleep(names: List<String>, fromServer: Boolean, fromX4: Boolean) = launchBusy("Deleting…") {
+        if (fromX4) {
+            val ops = target()
+            names.forEach { ops.storage.delete("${SleepSync.DIR}/$it.bmp") }
+            val known = sleepStore.load(SleepSync.DIR) - names.map { "$it.bmp" }.toSet()
+            sleepStore.save(SleepSync.DIR, known)
+            sleepOnX4 = listSleepOnX4(ops)
+        }
+        if (fromServer) { api.deleteSleep(names); loadSleep() }
+        message = "Deleted ${names.size} sleep screen(s)"
     }
 
     // ── Deleting / ignoring ─────────────────────────────────────
@@ -533,8 +592,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         api.chooseCover(folder, choice.id)
         coverPicker = null
         loadCover(folder, force = true)
-        refreshCoverPages(title)
-        message = "Cover set; updating the chapters' cover pages (send them to the X4 afterwards)"
+        message = "Cover set; Sync updates the chapters' cover pages"
     }
 
     /** A series row for a title folder (the Books tab only knows folders). */
@@ -721,6 +779,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Switching screen or cover page makes every chapter "not converted"; Sync converts them again. */
     fun setDevice(device: String) { prefs.device = device; refreshAll(); message = "Next Sync converts the chapters for the ${device.uppercase()}" }
+    fun setSleepGenerate(on: Boolean) { prefs.sleepGenerate = on }
+    fun setSleepSend(on: Boolean) { prefs.sleepSend = on }
     fun setCoverPage(on: Boolean) { prefs.coverPage = on; refreshAll(); message = "Next Sync converts the chapters ${if (on) "with" else "without"} a cover page" }
 
     fun setAutoSync(enabled: Boolean = prefs.autoSync, hours: Int = prefs.autoSyncHours,

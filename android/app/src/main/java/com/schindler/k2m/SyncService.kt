@@ -193,7 +193,7 @@ class SyncService : Service() {
                 val ip = resolveX4(task.device) ?: return result("Can't find the X4",
                     "Start File Transfer on the X4; it must be on your home WiFi to send from the server.", error = true)
                 show("Asking the server to send ${task.books.size} book(s)…", 0, 0)
-                val job = api.serverPush(ip, task.books, task.replace, task.dests)
+                val job = api.serverPush(ip, task.books, task.replace, task.dests, sleep = Prefs(this).sleepSend)
                 watch(job.id, "Send to X4 (from server)", task.dests)
             }
             is Task.PhonePush -> phonePush(task)
@@ -298,6 +298,11 @@ class SyncService : Service() {
                 failed += "✗ $name: not saved on the phone (${e.message})"
             }
         }
+        if (Prefs(this).sleepSend) {
+            for (folder in books.map { it.split('/').getOrNull(1) }.filterNotNull().distinct()) {
+                runCatching { SleepSync.fetch(api, sleepCache, folder) }
+            }
+        }
         return ready to failed
     }
 
@@ -400,8 +405,20 @@ class SyncService : Service() {
         } finally {
             TaskBus.bytesLeft.value = null
         }
+        var sleepSent = 0
+        if (Prefs(this).sleepSend && (pushed + updated + skipped) > 0 && !failed.any { it.startsWith("Stopped") }) {
+            show("Sending sleep screens…", 0, 0)
+            try {
+                sleepSent = SleepSync.send(ops, api, sleepCache, pushedStore, t.books.mapNotNull { it.split('/').getOrNull(1) })
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                failed += "✗ sleep screens: ${e.message}"
+            }
+        }
         val summary = listOfNotNull(
             "$pushed sent".takeIf { pushed > 0 },
+            "$sleepSent sleep screen(s) sent".takeIf { sleepSent > 0 },
             "$updated updated with only their changed files ($deltaFiles files, ${formatBytes(deltaBytes)})".takeIf { updated > 0 },
             "$skipped already on the X4".takeIf { skipped > 0 },
             "${failed.count { it.startsWith("✗") }} failed".takeIf { failed.isNotEmpty() }).joinToString(", ")
@@ -508,6 +525,7 @@ class SyncService : Service() {
     }
 
     @Volatile private var cancelNote: String? = null
+    private val sleepCache get() = java.io.File(filesDir, "sleep")
 
     /** Book operations for [device]: the SD card plugged into the phone ([CARD]), or the X4 over WiFi. Null if
      *  it isn't reachable. */

@@ -164,7 +164,58 @@ check("candidate_chosen", st == 200 and (covers_dir / "Test Title.custom.jpg").r
 st, _ = req("POST", "/api/covers/choose", {"title": "Test Title", "id": "../../etc/passwd"})
 check("candidate_rejects_bad", st == 404)
 
-# 10. Delete + don't sync again: the book and its CBZ go, the chapter is remembered as ignored; "sync again" undoes it.
+# 10. Sleep screens: drawn from the series art, custom images survive regeneration, pushed to /sleep on the X4.
+from PIL import Image
+st, res = req("POST", "/api/sleep/generate", {"titles": ["Test Title"], "device": "x4"})
+check("sleep_generate", st == 200 and res["results"].get("Test Title") in ("created", "updated"), str(res))
+sleep_bmp = Path(OUT) / ".sleep/Test Title.bmp"
+im = Image.open(sleep_bmp)
+check("sleep_bmp_format", im.size == (480, 800) and im.mode == "L", f"{im.size} {im.mode}")
+st, res = req("GET", "/api/sleep")
+check("sleep_list", any(i["name"] == "Test Title" and not i["custom"] for i in res["items"]), str(res))
+st, img = req("GET", "/api/sleep/image?name=Test%20Title", raw=True)
+check("sleep_image_preview", st == 200 and img[:2] == b"\xff\xd8")
+st, f = req("GET", "/api/sleep/file?name=Test%20Title", raw=True)
+check("sleep_file", st == 200 and f == sleep_bmp.read_bytes())
+st, res = req("POST", "/api/sleep/generate", {"titles": ["Test Title"], "device": "x4"})
+check("sleep_unchanged", res["results"].get("Test Title") == "unchanged", str(res))
+st, _ = req("POST", "/api/sleep/generate", {"titles": ["../x"]})
+check("sleep_generate_rejects_bad", st == 400)
+
+st, job = req("POST", "/api/device/push", {"device": X4, "books": ["manga/Test Title/Chapter 2"]})
+check("push_without_sleep", not (Path(SD) / "sleep").exists() and wait(job["id"])["status"] == "done")
+st, job = req("POST", "/api/device/push", {"device": X4, "books": ["manga/Test Title/Chapter 2"], "sleep": True})
+wait(job["id"])
+x4_sleep = Path(SD) / "sleep/Test Title.bmp"
+check("sleep_pushed", x4_sleep.is_file() and x4_sleep.read_bytes() == sleep_bmp.read_bytes())
+marker = b"\0" * len(sleep_bmp.read_bytes())
+x4_sleep.write_bytes(marker)
+st, job = req("POST", "/api/device/push", {"device": X4, "books": ["manga/Test Title/Chapter 2"], "sleep": True})
+wait(job["id"])
+check("sleep_repush_skipped", x4_sleep.read_bytes() == marker)
+x4_sleep.unlink()
+st, job = req("POST", "/api/device/push", {"device": X4, "books": ["manga/Test Title/Chapter 2"], "sleep": True})
+wait(job["id"])
+check("sleep_repush_when_missing", x4_sleep.is_file())
+
+Image.new("RGB", (100, 100), (0, 0, 255)).save(buf := io.BytesIO(), "PNG")
+st, _ = req("PUT", "/api/sleep?name=Test%20Title&device=x4", buf.getvalue(), {"Content-Type": "image/png"})
+check("sleep_custom_upload", st == 200 and Image.open(sleep_bmp).size == (480, 800))
+custom = sleep_bmp.read_bytes()
+st, res = req("POST", "/api/sleep/generate", {"titles": ["Test Title"], "device": "x4"})
+check("sleep_custom_kept", res["results"].get("Test Title") == "custom" and sleep_bmp.read_bytes() == custom, str(res))
+st, res = req("POST", "/api/sleep/generate", {"titles": ["Test Title"], "device": "x4", "force": True})
+check("sleep_force_redraws", res["results"].get("Test Title") in ("updated", "created") and sleep_bmp.read_bytes() != custom, str(res))
+st, _ = req("PUT", "/api/sleep?name=Test%20Title", b"not an image")
+check("sleep_upload_rejects_non_image", st == 400)
+
+st, job = req("POST", "/api/jobs", {"chapters": ["Test Title/Chapter 2.cbz"], "force": True, "device": "x4", "sleep": True})
+j = wait(job["id"])
+check("sleep_on_convert", j["status"] == "done" and "sleep screen" in (j.get("note") or "") or sleep_bmp.is_file(), str(j.get("note")))
+st, res = req("POST", "/api/sleep/delete", {"names": ["Test Title"]})
+check("sleep_delete", res.get("deleted") == ["Test Title"] and not sleep_bmp.exists(), str(res))
+
+# 11. Delete + don't sync again: the book and its CBZ go, the chapter is remembered as ignored; "sync again" undoes it.
 st, job = req("POST", "/api/books/delete", {"books": ["manga/Test Title/Chapter 2"], "ignore": True})
 j = wait(job["id"])
 check("delete_job", j["status"] == "done" and j["outcomes"][0]["status"] == "deleted", str(j))

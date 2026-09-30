@@ -27,6 +27,8 @@ interface ServerSettings {
     val device: String get() = "x4"
     /** Add a cover page (series art + large chapter number) as each chapter's first page. */
     val coverPage: Boolean get() = true
+    /** Have the server draw a sleep screen from the series art when it converts a series. */
+    val sleepGenerate: Boolean get() = false
 }
 
 /** App settings. Stored in app-private preferences, which other apps can't read. */
@@ -50,6 +52,13 @@ class Prefs(ctx: Context) : ServerSettings {
     override var coverPage: Boolean
         get() = p.getBoolean("coverPage", true)
         set(v) = p.edit().putBoolean("coverPage", v).apply()
+    override var sleepGenerate: Boolean
+        get() = p.getBoolean("sleepGenerate", false)
+        set(v) = p.edit().putBoolean("sleepGenerate", v).apply()
+    /** Send a series' sleep screen to the X4's /sleep folder along with its books. */
+    var sleepSend: Boolean
+        get() = p.getBoolean("sleepSend", false)
+        set(v) = p.edit().putBoolean("sleepSend", v).apply()
     /** The last address the X4 answered at (auto-discovery tries it first). */
     var lastX4: String
         get() = p.getString("lastX4", "")!!
@@ -111,6 +120,7 @@ class Prefs(ctx: Context) : ServerSettings {
         override val token = this@Prefs.token
         override val device = this@Prefs.device
         override val coverPage = this@Prefs.coverPage
+        override val sleepGenerate = this@Prefs.sleepGenerate
     }
 }
 
@@ -140,6 +150,8 @@ data class Book(val path: String, val title: String, val files: Int, val bytes: 
     val titleFolder get() = path.split('/').getOrElse(1) { path }
     val name get() = path.substringAfterLast('/')
 }
+/** A sleep screen on the server: one per series folder ([name]); [custom] is the user's own image. */
+data class SleepItem(val name: String, val series: String, val bytes: Long, val mtime: Double, val custom: Boolean)
 data class Device(val ip: String, val hostname: String, val via: String)
 /** [fix]: "reconvert" (bad pages: convert again from scratch), "convert" (other screen / no cover page), or
  *  "cover" (redraw the cover page with series art); [folder] is the title folder, for cover art. */
@@ -282,7 +294,7 @@ class Api(private val prefs: ServerSettings) {
 
     suspend fun startJob(chapters: List<String>, force: Boolean = false): JobInfo =
         job(postJson("/api/jobs", JSONObject().put("chapters", JSONArray(chapters)).put("force", force)
-            .put("device", prefs.device).put("cover_page", prefs.coverPage)))
+            .put("device", prefs.device).put("cover_page", prefs.coverPage).put("sleep", prefs.sleepGenerate)))
 
     suspend fun job(id: String): JobInfo = job(getJson("/api/jobs/$id"))
     suspend fun jobs(): List<JobInfo> = getJson("/api/jobs").getJSONArray("jobs").map { job(it) }
@@ -342,8 +354,42 @@ class Api(private val prefs: ServerSettings) {
         Device(it.getString("ip"), it.getString("hostname"), "server")
     }
 
-    suspend fun serverPush(device: String, books: List<String>, replace: Boolean, dests: Map<String, String> = emptyMap()): JobInfo =
+    suspend fun sleepList(): List<SleepItem> = getJson("/api/sleep").getJSONArray("items").map {
+        SleepItem(it.getString("name"), it.optString("series", it.getString("name")), it.getLong("bytes"), it.optDouble("mtime"), it.optBoolean("custom"))
+    }
+
+    /** A JPEG preview of a sleep screen, [width] px wide; null if there isn't one. */
+    suspend fun sleepImage(name: String, width: Int): ByteArray? = withContext(Dispatchers.IO) {
+        val url = baseUrl() + "/api/sleep/image?name=${enc(name)}&w=$width"
+        runCatching { http.newCall(req(url).build()).execute().use { r -> if (r.isSuccessful) r.body!!.bytes() else null } }.getOrNull()
+    }
+
+    /** The sleep screen's BMP, as it goes on the X4; null if the server has none (or can't be reached). */
+    suspend fun sleepFile(name: String): ByteArray? = withContext(Dispatchers.IO) {
+        val url = baseUrl() + "/api/sleep/file?name=${enc(name)}"
+        runCatching { http.newCall(req(url).build()).execute().use { r -> if (r.isSuccessful) r.body!!.bytes() else null } }.getOrNull()
+    }
+
+    /** Draw sleep screens from series art for [folders] (null = every series); returns folder → result. */
+    suspend fun sleepGenerate(folders: List<String>?, force: Boolean = false): Map<String, String> {
+        val body = JSONObject().put("device", prefs.device).put("force", force)
+        if (folders == null) body.put("all", true) else body.put("titles", JSONArray(folders))
+        val r = postJson("/api/sleep/generate", body).getJSONObject("results")
+        return r.keys().asSequence().associateWith { r.getString(it) }
+    }
+
+    suspend fun setSleep(name: String, image: ByteArray) {
+        call("/api/sleep?name=${enc(name)}&device=${prefs.device}") { it.put(image.toRequestBody("image/jpeg".toMediaType())) }
+    }
+
+    suspend fun deleteSleep(names: List<String>) {
+        postJson("/api/sleep/delete", JSONObject().put("names", JSONArray(names)))
+    }
+
+    suspend fun serverPush(device: String, books: List<String>, replace: Boolean, dests: Map<String, String> = emptyMap(),
+                           sleep: Boolean = false): JobInfo =
         job(postJson("/api/device/push", JSONObject().put("device", device).put("books", JSONArray(books)).put("replace", replace)
+            .put("sleep", sleep)
             .put("dests", JSONObject(dests.mapValues { "/" + it.value.trim('/') }))))
 
     private fun job(j: JSONObject) = JobInfo(

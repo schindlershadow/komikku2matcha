@@ -23,6 +23,8 @@ for _ in $(seq 120); do
   [ "$("$ADB" -s $SERIAL shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ] && break
   sleep 2
 done
+# The emulator's disk persists: a stale copy would make the optional real-archive test run (and fail) on old data.
+"$ADB" -s $SERIAL shell rm -f /data/local/tmp/k2m_real.cbz >/dev/null 2>&1
 [ -n "${K2M_REAL_CBZ:-}" ] && "$ADB" -s $SERIAL push "$K2M_REAL_CBZ" /data/local/tmp/k2m_real.cbz >/dev/null
 ./gradlew connectedDebugAndroidTest --console=plain -q
 rc=$?
