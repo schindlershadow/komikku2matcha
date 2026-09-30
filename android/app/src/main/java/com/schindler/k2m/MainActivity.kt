@@ -150,7 +150,7 @@ fun StatusLine(vm: AppViewModel) {
     LinearProgressIndicator(Modifier.fillMaxWidth())
     Row(verticalAlignment = Alignment.CenterVertically) {
         Text(status, Modifier.weight(1f).padding(horizontal = 16.dp, vertical = 4.dp), style = MaterialTheme.typography.bodySmall,
-            maxLines = 2, overflow = TextOverflow.Ellipsis)
+            maxLines = 6, overflow = TextOverflow.Ellipsis)
         // Only background tasks (uploads, sends, watching a job) can be cancelled; quick in-app checks can't.
         if (taskStatus != null) TextButton(onClick = { vm.cancelTask() }) { Text("Cancel") }
     }
@@ -363,6 +363,8 @@ fun JobsScreen(vm: AppViewModel) {
                                     (j.pagesTotal?.takeIf { it > 0 && j.active }?.let { " · ${j.pagesDone}/$it pages" } ?: "") +
                                     (j.etaSeconds?.takeIf { j.active }?.let { " · ~${formatDuration(it)} left" } ?: "") +
                                     " · " + DateUtils.getRelativeTimeSpanString((j.created * 1000).toLong()), style = MaterialTheme.typography.bodySmall)
+                                if (j.titles.isNotEmpty()) Text(j.titles.take(3).joinToString(", ") + (if (j.titles.size > 3) " +${j.titles.size - 3} more" else ""),
+                                    style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
                                 j.note?.let { Text(it, style = MaterialTheme.typography.labelSmall) }
                             }
                             if (j.active) {
@@ -674,7 +676,7 @@ fun CoverPickerDialog(vm: AppViewModel, title: TitleRow) {
                         val mod = Modifier.fillMaxWidth().height(120.dp).clip(androidx.compose.foundation.shape.RoundedCornerShape(4.dp))
                         if (img != null) androidx.compose.foundation.Image(img, c.label, mod, contentScale = androidx.compose.ui.layout.ContentScale.Crop)
                         else Box(mod.background(MaterialTheme.colorScheme.surfaceVariant))
-                        Text(c.label, style = MaterialTheme.typography.labelSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        Text(c.label, style = MaterialTheme.typography.labelSmall, maxLines = 6, overflow = TextOverflow.Ellipsis)
                     }
                 }
             }

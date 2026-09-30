@@ -142,6 +142,8 @@ data class JobInfo(
     /** A server-side push's byte progress across the whole job (an upper bound: a delta sync may send less
      *  than a book's full size), so the bar still moves within a single book. */
     val bytesTotal: Long? = null, val bytesDone: Long = 0,
+    /** Title folders the job is about (converted / sent / deleted). */
+    val titles: List<String> = emptyList(),
 ) {
     val active get() = status == "queued" || status == "running"
 }
@@ -409,6 +411,7 @@ class Api(private val prefs: ServerSettings) {
         note = j.optString("note").takeIf { !j.isNull("note") && it.isNotEmpty() },
         bytesTotal = if (j.isNull("bytes_total")) null else j.optLong("bytes_total", -1).takeIf { it >= 0 },
         bytesDone = j.optLong("bytes_done"),
+        titles = (j.optJSONArray("titles") ?: JSONArray()).let { a -> (0 until a.length()).map { a.getString(it) } },
     )
 
     companion object {

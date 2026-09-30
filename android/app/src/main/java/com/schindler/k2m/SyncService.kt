@@ -113,7 +113,9 @@ class SyncService : Service() {
         if (intent?.action == ACTION_CANCEL) {
             TaskBus.queue.clear()
             currentTask?.cancel()
-            serverJob?.let { id -> scope.launch { runCatching { api.cancel(id) } } }
+            val ids = watchers.keys.toList() + listOfNotNull(serverJob)
+            watchers.values.forEach { it.cancel() }
+            ids.forEach { id -> scope.launch { runCatching { api.cancel(id) } } }
             if (!running) stopSelfResult(startId)
             return START_NOT_STICKY
         }
@@ -147,15 +149,23 @@ class SyncService : Service() {
         val ticker = scope.launch { while (true) { delay(RateMeter.SAMPLE_MS); RateMeter.tick() } }
         try {
             while (true) {
+                var idle = false
                 val task = TaskBus.queue.poll() ?: synchronized(lock) {
-                    // Nothing left: stop, unless a start arrived meanwhile (stopSelfResult checks that).
+                    // Nothing left: stop once no server job is still being watched, unless a start arrived
+                    // meanwhile (stopSelfResult checks that).
                     if (TaskBus.queue.isEmpty()) {
-                        running = false
-                        stopForeground(STOP_FOREGROUND_REMOVE)
-                        stopSelfResult(lastStartId)
-                        null
+                        if (watchers.isEmpty()) {
+                            running = false
+                            stopForeground(STOP_FOREGROUND_REMOVE)
+                            stopSelfResult(lastStartId)
+                            null
+                        } else { idle = true; null }
                     } else TaskBus.queue.poll()
-                } ?: break
+                }
+                if (task == null) {
+                    if (idle) { delay(500); continue }
+                    break
+                }
                 val job = scope.launch {
                     try {
                         run(task)
@@ -169,11 +179,13 @@ class SyncService : Service() {
                 cancelNote = null
                 job.join()
                 currentTask = null
+                endLane(LANE_TASK)
                 TaskBus.finished.tryEmit(Unit)
             }
         } finally {
             ticker.cancel()
             RateMeter.reset()
+            lanes.clear()
             TaskBus.status.value = null
             if (wifi.isHeld) wifi.release()
             if (wake.isHeld) wake.release()
@@ -185,16 +197,16 @@ class SyncService : Service() {
             is Task.Sync -> {
                 val job = uploadAndStart(this, api, task, ::show)
                     ?: return result("Nothing to convert", "Everything is already converted")
-                watch(job.id, "Conversion")
+                watchInBackground(job.id, "Conversion")
             }
-            is Task.Watch -> watch(task.jobId, task.what)
+            is Task.Watch -> watchInBackground(task.jobId, task.what)
             is Task.ServerPush -> {
                 show("Looking for the X4…", 0, 0)
                 val ip = resolveX4(task.device) ?: return result("Can't find the X4",
                     "Start File Transfer on the X4; it must be on your home WiFi to send from the server.", error = true)
                 show("Asking the server to send ${task.books.size} book(s)…", 0, 0)
                 val job = api.serverPush(ip, task.books, task.replace, task.dests, sleep = Prefs(this).sleepSend)
-                watch(job.id, "Send to X4 (from server)", task.dests)
+                watchInBackground(job.id, "Send to X4 (from server)", task.dests)
             }
             is Task.PhonePush -> phonePush(task)
             is Task.SendEpub -> sendEpub(task)
@@ -241,17 +253,36 @@ class SyncService : Service() {
     /** Poll a server job until it ends; network hiccups (e.g. leaving home WiFi) are retried for a while. */
     private suspend fun watch(id: String, what: String, dests: Map<String, String> = emptyMap()) {
         serverJob = id
-        try { watchLoop(id, what, dests) } finally { serverJob = null }
+        try { watchLoop(id, what, dests, LANE_TASK) } finally { serverJob = null }
     }
 
-    private suspend fun watchLoop(id: String, what: String, dests: Map<String, String>) {
+    /** Watch a server job on its own coroutine, so the next queued task (e.g. another sync) starts right away
+     *  and several jobs can be followed at once; the service stays alive until they all finish. */
+    private fun watchInBackground(id: String, what: String, dests: Map<String, String> = emptyMap()) {
+        synchronized(lock) {
+            watchers[id] = scope.launch {
+                try {
+                    watchLoop(id, what, dests, id)
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    result("Cancelled", "$what stopped by you.")
+                } catch (e: Exception) {
+                    result("Failed", e.message ?: e.javaClass.simpleName, error = true)
+                } finally {
+                    synchronized(lock) { watchers.remove(id) }
+                    endLane(id)
+                }
+            }
+        }
+    }
+
+    private suspend fun watchLoop(id: String, what: String, dests: Map<String, String>, lane: String) {
         var failures = 0
         while (true) {
             val j = try {
                 api.job(id).also { failures = 0 }
             } catch (e: ApiException) {
                 if (++failures > 100) throw e  // ~10 minutes without the server
-                show("$what: waiting for the server…", 0, 0)
+                show("$what: waiting for the server…", 0, 0, lane)
                 delay(6000)
                 continue
             }
@@ -274,7 +305,7 @@ class SyncService : Service() {
             val (cur, max) = if (bytesTotal != null)
                 ((j.bytesDone.coerceIn(0, bytesTotal) * 1000 / bytesTotal).toInt()) to 1000
             else j.done to total
-            show("$what ${j.done}/${if (total > 0) total else "?"}$current$pages$bytes$eta", cur, max)
+            show("$what ${j.done}/${if (total > 0) total else "?"}$current$pages$bytes$eta", cur, max, lane)
             delay(3000)
         }
     }
@@ -509,19 +540,31 @@ class SyncService : Service() {
     }
 
     private var lastShown = 0L
-    private var lastText = ""
+    private val lanes = LinkedHashMap<String, String>()
+    private val watchers = java.util.concurrent.ConcurrentHashMap<String, kotlinx.coroutines.Job>()
+
+    private fun publish(cur: Int, max: Int) {
+        val text = synchronized(lanes) { lanes.values.joinToString("\n") }
+        TaskBus.status.value = text.ifEmpty { null }
+        if (text.isNotEmpty()) nm.notify(ID_PROGRESS, progress(text.replace("\n", " | "), cur, max))
+    }
+
+    private fun endLane(lane: String) {
+        synchronized(lanes) { lanes.remove(lane) }
+        publish(0, 0)
+    }
 
     /**
-     * Update the progress notification and the in-app status line, at most ~3 times a second: uploads
-     * report every 64 KB, and posting a notification that often makes the whole phone stutter.
+     * Update the progress notification and the in-app status, at most ~3 times a second: uploads
+     * report every 64 KB, and posting a notification that often makes the whole phone stutter. Each
+     * concurrent activity (the local task, each watched server job) has its own [lane] line.
      */
-    private fun show(text: String, cur: Int, max: Int) {
+    private fun show(text: String, cur: Int, max: Int, lane: String = LANE_TASK) {
         val now = android.os.SystemClock.elapsedRealtime()
-        if (now - lastShown < 300 && cur != max && lastText.isNotEmpty()) return
+        val isNew = synchronized(lanes) { val n = lane !in lanes; lanes[lane] = text; n }
+        if (now - lastShown < 300 && cur != max && !isNew) return
         lastShown = now
-        lastText = text
-        TaskBus.status.value = text
-        nm.notify(ID_PROGRESS, progress(text, cur, max))
+        publish(cur, max)
     }
 
     @Volatile private var cancelNote: String? = null
@@ -550,6 +593,7 @@ class SyncService : Service() {
 
     companion object {
         const val ID_PROGRESS = 1
+        private const val LANE_TASK = "task"
         const val ACTION_CANCEL = "com.schindler.k2m.CANCEL"
         fun createChannels(ctx: Context) = Notify.createChannels(ctx)
     }

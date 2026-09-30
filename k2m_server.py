@@ -445,8 +445,10 @@ class Jobs:
                 pass
         for jid in sorted(resume, key=lambda i: self.jobs[i]["created"]):
             self.queues[self.jobs[jid]["kind"]].append(jid)
-        for kind in self.queues:
-            threading.Thread(target=self._worker, args=(kind,), daemon=True).start()
+        workers = {"convert": int(cfg.get("convert_workers", 2)), "push": int(cfg.get("push_workers", 2)), "delete": 1}
+        for kind, n in workers.items():
+            for _ in range(max(1, n)):
+                threading.Thread(target=self._worker, args=(kind,), daemon=True).start()
 
     def _save(self):
         recent = sorted(self.jobs.values(), key=lambda j: j["created"])[-200:]
@@ -485,14 +487,27 @@ class Jobs:
             j = self.jobs.get(jid)
             if j and j["status"] == "running" and j["kind"] == "convert":
                 self._eta(j)
-            return json.loads(json.dumps(j)) if j else None
+            return {**json.loads(json.dumps(j)), "titles": self._titles(j)} if j else None
+
+    @staticmethod
+    def _titles(job) -> list[str]:
+        """Title folders a job is about: converted chapters when known, else what was asked for."""
+        def title(label: str) -> str | None:
+            parts = label.split("/")
+            if job["kind"] == "convert":
+                return parts[0] if len(parts) > 1 else None
+            return parts[1] if len(parts) > 2 else None
+        p = job["params"]
+        labels = [o["label"] for o in job.get("outcomes", []) if o.get("status") in ("converted", "pushed", "deleted", "skipped")]
+        labels = labels or list(p.get("chapters") or p.get("books") or [])
+        return list(dict.fromkeys(t for l in labels if (t := title(l))))
 
     def list(self) -> list[dict]:
         with self.lock:
             for j in self.jobs.values():
                 if j["status"] == "running" and j["kind"] == "convert":
                     self._eta(j)
-            return [{k: v for k, v in j.items() if k not in ("outcomes", "plan_pages")}
+            return [{**{k: v for k, v in j.items() if k not in ("outcomes", "plan_pages")}, "titles": self._titles(j)}
                     for j in sorted(self.jobs.values(), key=lambda j: -j["created"])[:50]]
 
     def clear_finished(self) -> int:
@@ -529,12 +544,30 @@ class Jobs:
                 lines.append(f"  warning: {o['warning']}")
         return "\n".join(lines)
 
+    def _conflicts(self, a: dict, b: dict) -> bool:
+        """Whether two same-kind jobs must not run at once: converting the same chapter twice would race on its
+        output, and two sends to one device would fight over it. An empty chapter list means "everything"."""
+        pa, pb = a["params"], b["params"]
+        if a["kind"] == "convert":
+            ca, cb = pa.get("chapters"), pb.get("chapters")
+            return not ca or not cb or bool(set(ca) & set(cb))
+        if a["kind"] == "push":
+            return pa.get("device") == pb.get("device")
+        return True
+
+    def _next_runnable(self, kind: str) -> str | None:
+        running = [j for j in self.jobs.values() if j["kind"] == kind and j["status"] == "running"]
+        for jid in self.queues[kind]:
+            if not any(self._conflicts(self.jobs[jid], r) for r in running):
+                return jid
+        return None
+
     def _worker(self, kind: str):
         while True:
             with self.cv:
-                while not self.queues[kind]:
+                while (jid := self._next_runnable(kind)) is None:
                     self.cv.wait()
-                jid = self.queues[kind].pop(0)
+                self.queues[kind].remove(jid)
                 job = self.jobs[jid]
                 job["status"], job["started"] = "running", time.time()
                 self._save()
@@ -554,6 +587,7 @@ class Jobs:
                 job["current"] = None
                 self.procs.pop(jid, None)
                 self._save()
+                self.cv.notify_all()
             if self.cfg.get("gotify"):
                 n = {s: sum(o["status"] == s for o in job["outcomes"]) for s in ("converted", "pushed", "failed")}
                 k2m.notify(f"k2m {kind} {job['status']}",
@@ -1327,6 +1361,7 @@ def main():
         return
     Handler.cfg = cfg
     Handler.jobs = Jobs(cfg)
+    ThreadingHTTPServer.request_queue_size = 128  # the default backlog of 5 drops connections under load
     srv = ThreadingHTTPServer((cfg["host"], int(cfg["port"])), Handler)
     srv.daemon_threads = True
     print(f"k2m-server on {cfg['host']}:{cfg['port']}  input={cfg['input']}  output={cfg['output']}", flush=True)
