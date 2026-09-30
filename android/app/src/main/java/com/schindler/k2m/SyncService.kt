@@ -138,13 +138,14 @@ class SyncService : Service() {
         super.onDestroy()
     }
 
+    private lateinit var wake: PowerManager.WakeLock
+    private lateinit var wifi: WifiManager.WifiLock
+
     private suspend fun drain() {
-        val wake = getSystemService(PowerManager::class.java).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "k2m:sync")
+        wake = getSystemService(PowerManager::class.java).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "k2m:sync")
         @Suppress("DEPRECATION")
-        val wifi = (applicationContext.getSystemService(WifiManager::class.java))
+        wifi = (applicationContext.getSystemService(WifiManager::class.java))
             .createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "k2m:sync")
-        wake.acquire(6 * 60 * 60 * 1000L)
-        wifi.acquire()
         RateMeter.reset()
         val ticker = scope.launch { while (true) { delay(RateMeter.SAMPLE_MS); RateMeter.tick() } }
         try {
@@ -177,8 +178,15 @@ class SyncService : Service() {
                 }
                 currentTask = job
                 cancelNote = null
-                job.join()
-                currentTask = null
+                // Held only while this device is actually doing work (uploads, sends, conversions on the
+                // phone); merely polling a server job needs neither, and held for a long conversion it drains the battery.
+                wake.acquire(2 * 60 * 60 * 1000L)
+                wifi.acquire()
+                try { job.join() } finally {
+                    if (wifi.isHeld) wifi.release()
+                    if (wake.isHeld) wake.release()
+                    currentTask = null
+                }
                 endLane(LANE_TASK)
                 TaskBus.finished.tryEmit(Unit)
             }
@@ -187,8 +195,6 @@ class SyncService : Service() {
             RateMeter.reset()
             lanes.clear()
             TaskBus.status.value = null
-            if (wifi.isHeld) wifi.release()
-            if (wake.isHeld) wake.release()
         }
     }
 
@@ -253,7 +259,14 @@ class SyncService : Service() {
     /** Poll a server job until it ends; network hiccups (e.g. leaving home WiFi) are retried for a while. */
     private suspend fun watch(id: String, what: String, dests: Map<String, String> = emptyMap()) {
         serverJob = id
-        try { watchLoop(id, what, dests, LANE_TASK) } finally { serverJob = null }
+        // Waiting on the server needs neither lock; take them back for whatever the task does next.
+        if (wifi.isHeld) wifi.release()
+        if (wake.isHeld) wake.release()
+        try { watchLoop(id, what, dests, LANE_TASK) } finally {
+            serverJob = null
+            wake.acquire(2 * 60 * 60 * 1000L)
+            wifi.acquire()
+        }
     }
 
     /** Watch a server job on its own coroutine, so the next queued task (e.g. another sync) starts right away
@@ -306,7 +319,7 @@ class SyncService : Service() {
                 ((j.bytesDone.coerceIn(0, bytesTotal) * 1000 / bytesTotal).toInt()) to 1000
             else j.done to total
             show("$what ${j.done}/${if (total > 0) total else "?"}$current$pages$bytes$eta", cur, max, lane)
-            delay(3000)
+            delay(5000)
         }
     }
 
@@ -539,14 +552,16 @@ class SyncService : Service() {
         return if (rate <= 0) "" else " · ~${formatDuration((bytesLeft / rate).toLong())} left"
     }
 
-    private var lastShown = 0L
+    private val lastShown = HashMap<String, Long>()
+    private var lastPosted = ""
     private val lanes = LinkedHashMap<String, String>()
     private val watchers = java.util.concurrent.ConcurrentHashMap<String, kotlinx.coroutines.Job>()
 
     private fun publish(cur: Int, max: Int) {
         val text = synchronized(lanes) { lanes.values.joinToString("\n") }
         TaskBus.status.value = text.ifEmpty { null }
-        if (text.isNotEmpty()) nm.notify(ID_PROGRESS, progress(text.replace("\n", " | "), cur, max))
+        val key = "$text|$cur|$max"
+        if (text.isNotEmpty() && key != lastPosted) { lastPosted = key; nm.notify(ID_PROGRESS, progress(text.replace("\n", " | "), cur, max)) }
     }
 
     private fun endLane(lane: String) {
@@ -555,15 +570,18 @@ class SyncService : Service() {
     }
 
     /**
-     * Update the progress notification and the in-app status, at most ~3 times a second: uploads
-     * report every 64 KB, and posting a notification that often makes the whole phone stutter. Each
-     * concurrent activity (the local task, each watched server job) has its own [lane] line.
+     * Update the progress notification and the in-app status, at most ~3 times a second for the local task
+     * (uploads report every 64 KB; posting that often makes the phone stutter) and every few seconds for a
+     * watched server job. Each concurrent activity (the local task, each watched job) has its own [lane] line.
      */
     private fun show(text: String, cur: Int, max: Int, lane: String = LANE_TASK) {
         val now = android.os.SystemClock.elapsedRealtime()
         val isNew = synchronized(lanes) { val n = lane !in lanes; lanes[lane] = text; n }
-        if (now - lastShown < 300 && cur != max && !isNew) return
-        lastShown = now
+        val gap = if (lane == LANE_TASK) 300L else 5000L
+        synchronized(lastShown) {
+            if (!isNew && now - (lastShown[lane] ?: 0L) < gap) return
+            lastShown[lane] = now
+        }
         publish(cur, max)
     }
 
