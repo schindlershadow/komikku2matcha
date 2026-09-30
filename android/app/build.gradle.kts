@@ -14,8 +14,8 @@ android {
         applicationId = "com.schindler.k2m"
         minSdk = 26
         targetSdk = 36
-        versionCode = 30
-        versionName = "1.29"
+        versionCode = 31
+        versionName = "1.30"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
     // Release signing key lives outside the repo (~/android-build/k2m-keystore.properties); without it the
